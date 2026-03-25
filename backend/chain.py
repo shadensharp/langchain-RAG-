@@ -1,14 +1,11 @@
+from functools import lru_cache
 import os
 from operator import itemgetter
 from typing import Dict, List, Optional, Sequence
 
 import weaviate
-from constants import WEAVIATE_DOCS_INDEX_NAME
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from ingest import get_embeddings_model
-from langchain_anthropic import ChatAnthropic
-from langchain_community.chat_models import ChatCohere
 from langchain_community.vectorstores import Weaviate
 from langchain_core.documents import Document
 from langchain_core.language_models import LanguageModelLike
@@ -30,10 +27,23 @@ from langchain_core.runnables import (
     RunnableSequence,
     chain,
 )
-from langchain_fireworks import ChatFireworks
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from langsmith import Client
+
+try:
+    from constants import WEAVIATE_DOCS_INDEX_NAME
+    from env_utils import load_local_env, normalize_weaviate_url
+    from ingest import get_embeddings_model
+except ModuleNotFoundError:
+    from backend.constants import WEAVIATE_DOCS_INDEX_NAME
+    from backend.env_utils import load_local_env, normalize_weaviate_url
+    from backend.ingest import get_embeddings_model
+
+
+class MissingEnvironmentError(RuntimeError):
+    """Raised when the backend is started without required runtime configuration."""
+
+
+load_local_env()
 
 RESPONSE_TEMPLATE = """\
 You are an expert programmer and problem-solver, tasked with answering any question \
@@ -43,7 +53,7 @@ Generate a comprehensive and informative answer of 80 words or less for the \
 given question based solely on the provided search results (URL and content). You must \
 only use information from the provided search results. Use an unbiased and \
 journalistic tone. Combine search results together into a coherent answer. Do not \
-repeat text. Cite search results using [${{number}}] notation. Only cite the most \
+repeat text. Cite search results using [number] notation. Only cite the most \
 relevant results that answer the question accurately. Place these citations at the end \
 of the sentence or paragraph that reference them - do not put them all at the end. If \
 different results refer to different entities within the same name, write separate \
@@ -76,7 +86,7 @@ Generate a comprehensive and informative answer of 80 words or less for the \
 given question based solely on the provided search results (URL and content). You must \
 only use information from the provided search results. Use an unbiased and \
 journalistic tone. Combine search results together into a coherent answer. Do not \
-repeat text. Cite search results using [${{number}}] notation. Only cite the most \
+repeat text. Cite search results using [number] notation. Only cite the most \
 relevant results that answer the question accurately. Place these citations at the end \
 of the sentence or paragraph that reference them - do not put them all at the end. If \
 different results refer to different entities within the same name, write separate \
@@ -104,8 +114,6 @@ Follow Up Input: {question}
 Standalone Question:"""
 
 
-client = Client()
-
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -117,19 +125,35 @@ app.add_middleware(
 )
 
 
-WEAVIATE_URL = os.environ["WEAVIATE_URL"]
-WEAVIATE_API_KEY = os.environ["WEAVIATE_API_KEY"]
-
-
 class ChatRequest(BaseModel):
     question: str
     chat_history: Optional[List[Dict[str, str]]]
 
 
+def _require_env(*names: str) -> tuple[str, ...]:
+    missing = [name for name in names if not os.environ.get(name)]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise MissingEnvironmentError(
+            f"Missing required environment variables: {missing_list}"
+        )
+    return tuple(os.environ[name] for name in names)
+
+
+@lru_cache(maxsize=1)
 def get_retriever() -> BaseRetriever:
+    weaviate_url, weaviate_api_key, _ = _require_env(
+        "WEAVIATE_URL",
+        "WEAVIATE_API_KEY",
+        "DASHSCOPE_API_KEY",
+    )
     weaviate_client = weaviate.Client(
-        url=WEAVIATE_URL,
-        auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
+        url=normalize_weaviate_url(weaviate_url),
+        auth_client_secret=weaviate.AuthApiKey(api_key=weaviate_api_key),
+        timeout_config=(5, 60),
+        proxies={},
+        trust_env=False,
+        startup_period=None,
     )
     weaviate_client = Weaviate(
         client=weaviate_client,
@@ -236,43 +260,23 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     )
 
 
-gpt_3_5 = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0, streaming=True)
-claude_3_haiku = ChatAnthropic(
-    model="claude-3-haiku-20240307",
+qwen_llm = ChatOpenAI(
+    model="qwen-turbo",  # 或者 qwen-turbo / qwen-2.0 / qwen-2.2
     temperature=0,
+    streaming=False,
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key=os.environ.get("DASHSCOPE_API_KEY", "not_provided"),
     max_tokens=4096,
-    anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "not_provided"),
-)
-fireworks_mixtral = ChatFireworks(
-    model="accounts/fireworks/models/mixtral-8x7b-instruct",
-    temperature=0,
-    max_tokens=16384,
-    fireworks_api_key=os.environ.get("FIREWORKS_API_KEY", "not_provided"),
-)
-gemini_pro = ChatGoogleGenerativeAI(
-    model="gemini-pro",
-    temperature=0,
-    max_tokens=16384,
-    convert_system_message_to_human=True,
-    google_api_key=os.environ.get("GOOGLE_API_KEY", "not_provided"),
-)
-cohere_command = ChatCohere(
-    model="command",
-    temperature=0,
-    cohere_api_key=os.environ.get("COHERE_API_KEY", "not_provided"),
-)
-llm = gpt_3_5.configurable_alternatives(
-    # This gives this field an id
-    # When configuring the end runnable, we can then use this id to configure this field
-    ConfigurableField(id="llm"),
-    default_key="openai_gpt_3_5_turbo",
-    anthropic_claude_3_haiku=claude_3_haiku,
-    fireworks_mixtral=fireworks_mixtral,
-    google_gemini_pro=gemini_pro,
-    cohere_command=cohere_command,
-).with_fallbacks(
-    [gpt_3_5, claude_3_haiku, fireworks_mixtral, gemini_pro, cohere_command]
 )
 
-retriever = get_retriever()
-answer_chain = create_chain(llm, retriever)
+
+@lru_cache(maxsize=1)
+def get_answer_chain() -> Runnable:
+    return create_chain(qwen_llm, get_retriever())
+
+
+def _invoke_answer_chain(input: dict, config=None):
+    return get_answer_chain().invoke(input, config=config)
+
+
+answer_chain = RunnableLambda(_invoke_answer_chain)

@@ -1,8 +1,26 @@
 import re
 from typing import Generator
 
-from bs4 import BeautifulSoup, Doctype, NavigableString, Tag
+try:
+    from bs4 import BeautifulSoup, Doctype, NavigableString, Tag
+except ModuleNotFoundError as e:
+    # region agent log
+    import json
+    import time
 
+    log_entry = {
+        "sessionId": "c00c62",
+        "runId": "initial",
+        "hypothesisId": "H1",
+        "location": "backend/parser.py:bs4_import",
+        "message": "Failed to import bs4",
+        "data": {"error": str(e)},
+        "timestamp": int(time.time() * 1000),
+    }
+    with open("debug-c00c62.log", "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_entry) + "\n")
+    # endregion
+    raise
 
 def langchain_docs_extractor(soup: BeautifulSoup) -> str:
     # Remove all the tags that are not meaningful for the extraction.

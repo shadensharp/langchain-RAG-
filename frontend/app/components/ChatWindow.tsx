@@ -1,9 +1,10 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { useSearchParams } from "next/navigation";
+import Image from "next/image";
 import { RemoteRunnable } from "@langchain/core/runnables/remote";
-import { applyPatch } from "@langchain/core/utils/json_patch";
 
 import { EmptyState } from "./EmptyState";
 import { ChatMessageBubble, Message } from "./ChatMessageBubble";
@@ -14,6 +15,7 @@ import hljs from "highlight.js";
 import "highlight.js/styles/gradient-dark.css";
 
 import "react-toastify/dist/ReactToastify.css";
+import { toast } from "react-toastify";
 import {
   Heading,
   Flex,
@@ -27,16 +29,9 @@ import { Select, Link } from "@chakra-ui/react";
 import { Source } from "./SourceBubble";
 import { apiBaseUrl } from "../utils/constants";
 
-const MODEL_TYPES = [
-  "openai_gpt_3_5_turbo",
-  "anthropic_claude_3_haiku",
-  "google_gemini_pro",
-  "fireworks_mixtral",
-  "cohere_command",
-];
+const MODEL_TYPES = ["openai_gpt_3_5_turbo"];
 
-const defaultLlmValue =
-  MODEL_TYPES[Math.floor(Math.random() * MODEL_TYPES.length)];
+const defaultLlmValue = MODEL_TYPES[0];
 
 export function ChatWindow(props: { conversationId: string }) {
   const conversationId = props.conversationId;
@@ -51,10 +46,11 @@ export function ChatWindow(props: { conversationId: string }) {
     searchParams.get("llm") ?? "openai_gpt_3_5_turbo",
   );
   const [llmIsLoading, setLlmIsLoading] = useState(true);
+
   useEffect(() => {
     setLlm(searchParams.get("llm") ?? defaultLlmValue);
     setLlmIsLoading(false);
-  }, []);
+  }, [searchParams]);
 
   const [chatHistory, setChatHistory] = useState<
     { human: string; ai: string }[]
@@ -69,17 +65,24 @@ export function ChatWindow(props: { conversationId: string }) {
     }
     const messageValue = message ?? input;
     if (messageValue === "") return;
-    setInput("");
-    setMessages((prevMessages) => [
-      ...prevMessages,
-      { id: Math.random().toString(), content: messageValue, role: "user" },
-    ]);
-    setIsLoading(true);
+    let messageIndex: number | null = null;
+    const placeholderId = Math.random().toString();
+    flushSync(() => {
+      setInput("");
+      setMessages((prevMessages) => {
+        messageIndex = prevMessages.length + 1;
+        return [
+          ...prevMessages,
+          { id: Math.random().toString(), content: messageValue, role: "user" },
+          { id: placeholderId, content: "Thinking...", role: "assistant" },
+        ];
+      });
+      setIsLoading(true);
+    });
 
     let accumulatedMessage = "";
     let runId: string | undefined = undefined;
     let sources: Source[] | undefined = undefined;
-    let messageIndex: number | null = null;
 
     let renderer = new Renderer();
     renderer.paragraph = (text) => {
@@ -89,7 +92,7 @@ export function ChatWindow(props: { conversationId: string }) {
       return `${text}\n\n`;
     };
     renderer.listitem = (text) => {
-      return `\n• ${text}`;
+      return `\n- ${text}`;
     };
     renderer.code = (code, language) => {
       const validLanguage = hljs.getLanguage(language || "")
@@ -103,88 +106,76 @@ export function ChatWindow(props: { conversationId: string }) {
     };
     marked.setOptions({ renderer });
     try {
-      const sourceStepName = "FindDocs";
-      let streamedResponse: Record<string, any> = {};
       const remoteChain = new RemoteRunnable({
         url: apiBaseUrl + "/chat",
-        options: {
-          timeout: 60000,
-        },
+        options: { timeout: 180000 },
       });
       const llmDisplayName = llm ?? "openai_gpt_3_5_turbo";
-      const streamLog = await remoteChain.streamLog(
+
+      // Use invoke() for non-streaming backends (e.g. Qwen with streaming=False).
+      // streamLog does not reliably yield output when LLM is non-streaming.
+      const invokeResult = await remoteChain.invoke(
         {
           question: messageValue,
           chat_history: chatHistory,
         },
         {
-          configurable: {
-            llm: llmDisplayName,
-          },
+          configurable: { llm: llmDisplayName },
           tags: ["model:" + llmDisplayName],
           metadata: {
             conversation_id: conversationId,
             llm: llmDisplayName,
           },
         },
-        {
-          includeNames: [sourceStepName],
-        },
       );
-      for await (const chunk of streamLog) {
-        streamedResponse = applyPatch(streamedResponse, chunk.ops, undefined, false).newDocument;
-        if (
-          Array.isArray(
-            streamedResponse?.logs?.[sourceStepName]?.final_output?.output,
-          )
-        ) {
-          sources = streamedResponse.logs[
-            sourceStepName
-          ].final_output.output.map((doc: Record<string, any>) => ({
-            url: doc.metadata.source,
-            title: doc.metadata.title,
-          }));
-        }
-        if (streamedResponse.id !== undefined) {
-          runId = streamedResponse.id;
-        }
-        if (Array.isArray(streamedResponse?.streamed_output)) {
-          accumulatedMessage = streamedResponse.streamed_output.join("");
-        }
-        const parsedResult = marked.parse(accumulatedMessage);
+      accumulatedMessage =
+        typeof invokeResult === "string"
+          ? invokeResult
+          : String(invokeResult ?? "");
+      const parsedResult = marked.parse(accumulatedMessage);
 
-        setMessages((prevMessages) => {
-          let newMessages = [...prevMessages];
-          if (
-            messageIndex === null ||
-            newMessages[messageIndex] === undefined
-          ) {
-            messageIndex = newMessages.length;
-            newMessages.push({
-              id: Math.random().toString(),
-              content: parsedResult.trim(),
-              runId: runId,
-              sources: sources,
-              role: "assistant",
-            });
-          } else if (newMessages[messageIndex] !== undefined) {
-            newMessages[messageIndex].content = parsedResult.trim();
-            newMessages[messageIndex].runId = runId;
-            newMessages[messageIndex].sources = sources;
-          }
-          return newMessages;
-        });
-      }
+      setMessages((prevMessages) => {
+        const newMessages = [...prevMessages];
+        const idx =
+          messageIndex !== null && newMessages[messageIndex] !== undefined
+            ? messageIndex
+            : newMessages.length;
+        if (newMessages[idx]?.role === "assistant") {
+          newMessages[idx] = {
+            ...newMessages[idx],
+            content: parsedResult.trim(),
+            runId: runId,
+            sources: sources,
+          };
+        } else {
+          newMessages.push({
+            id: Math.random().toString(),
+            content: parsedResult.trim(),
+            runId: runId,
+            sources: sources,
+            role: "assistant",
+          });
+        }
+        return newMessages;
+      });
+
       setChatHistory((prevChatHistory) => [
         ...prevChatHistory,
         { human: messageValue, ai: accumulatedMessage },
       ]);
       setIsLoading(false);
     } catch (e) {
-      setMessages((prevMessages) => prevMessages.slice(0, -1));
+      setMessages((prevMessages) =>
+        prevMessages.filter((message) => message.id !== placeholderId),
+      );
       setIsLoading(false);
       setInput(messageValue);
-      throw e;
+      console.error("Error sending message:", e);
+      toast.error(
+        e instanceof Error
+          ? e.message
+          : "Request failed. Check backend and try again.",
+      );
     }
   };
 
@@ -254,13 +245,7 @@ export function ChatWindow(props: { conversationId: string }) {
                 }}
                 width={"240px"}
               >
-                <option value="openai_gpt_3_5_turbo">GPT-3.5-Turbo</option>
-                <option value="anthropic_claude_3_haiku">Claude 3 Haiku</option>
-                <option value="google_gemini_pro">Google Gemini Pro</option>
-                <option value="fireworks_mixtral">
-                  Mixtral (via Fireworks.ai)
-                </option>
-                <option value="cohere_command">Cohere</option>
+                <option value="openai_gpt_3_5_turbo">Qwen Turbo</option>
               </Select>
             )}
           </div>
@@ -292,8 +277,19 @@ export function ChatWindow(props: { conversationId: string }) {
           maxRows={5}
           marginRight={"56px"}
           placeholder="What does RunnablePassthrough.assign() do?"
-          textColor={"white"}
+          color={"white"}
+          bg={"rgba(255, 255, 255, 0.06)"}
           borderColor={"rgb(58, 58, 61)"}
+          _placeholder={{ color: "rgba(255, 255, 255, 0.55)" }}
+          _focus={{
+            color: "white",
+            bg: "rgba(255, 255, 255, 0.08)",
+            borderColor: "blue.400",
+          }}
+          _hover={{
+            borderColor: "rgb(80, 80, 84)",
+          }}
+          spellCheck={false}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -325,9 +321,16 @@ export function ChatWindow(props: { conversationId: string }) {
           <a
             href="https://github.com/langchain-ai/chat-langchain"
             target="_blank"
+            rel="noreferrer"
             className="text-white flex items-center"
           >
-            <img src="/images/github-mark.svg" className="h-4 mr-1" />
+            <Image
+              src="/images/github-mark.svg"
+              className="h-4 mr-1"
+              alt=""
+              width={16}
+              height={16}
+            />
             <span>View Source</span>
           </a>
         </footer>

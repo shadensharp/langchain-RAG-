@@ -103,6 +103,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
@@ -130,14 +132,24 @@ dmypy.json
 
 # JetBrains
 .idea
+.idea/
+.vscode/
+.cursor/
 
 *.db
+*.sqlite
+*.sqlite3
+record_manager_*.sql
+DEBUG_LOG.md
 
 .DS_Store
 
 vectorstore.pkl
 langchain.readthedocs.io/
 .vercel
+.next/
+out/
+.turbo/
 
 bin/
 pyvenv.cfg

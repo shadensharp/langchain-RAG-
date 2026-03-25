@@ -1,17 +1,46 @@
 """Main entrypoint for the app."""
 import asyncio
+import os
 from typing import Optional, Union
 from uuid import UUID
 
 import langsmith
-from chain import ChatRequest, answer_chain
 from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langserve import add_routes
 from langsmith import Client
 from pydantic import BaseModel
 
-client = Client()
+try:
+    from env_utils import load_local_env
+except ModuleNotFoundError:
+    from backend.env_utils import load_local_env
+
+try:
+    from chain import ChatRequest, MissingEnvironmentError, answer_chain
+except ModuleNotFoundError:
+    from backend.chain import ChatRequest, MissingEnvironmentError, answer_chain
+
+
+load_local_env()
+
+
+def _build_langsmith_client() -> Optional[Client]:
+    if not os.environ.get("LANGCHAIN_API_KEY"):
+        return None
+    return Client()
+
+
+client = _build_langsmith_client()
+
+
+def _require_langsmith_client() -> Client:
+    if client is None:
+        raise HTTPException(status_code=503, detail="LangSmith is not configured")
+    return client
 
 app = FastAPI()
 app.add_middleware(
@@ -22,6 +51,13 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+@app.exception_handler(MissingEnvironmentError)
+async def handle_missing_environment_error(
+    request: Request, exc: MissingEnvironmentError
+):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 add_routes(
@@ -44,7 +80,7 @@ class SendFeedbackBody(BaseModel):
 
 @app.post("/feedback")
 async def send_feedback(body: SendFeedbackBody):
-    client.create_feedback(
+    _require_langsmith_client().create_feedback(
         body.run_id,
         body.key,
         score=body.score,
@@ -68,7 +104,7 @@ async def update_feedback(body: UpdateFeedbackBody):
             "result": "No feedback ID provided",
             "code": 400,
         }
-    client.update_feedback(
+    _require_langsmith_client().update_feedback(
         feedback_id,
         score=body.score,
         comment=body.comment,
@@ -82,16 +118,17 @@ async def _arun(func, *args, **kwargs):
 
 
 async def aget_trace_url(run_id: str) -> str:
+    langsmith_client = _require_langsmith_client()
     for i in range(5):
         try:
-            await _arun(client.read_run, run_id)
+            await _arun(langsmith_client.read_run, run_id)
             break
         except langsmith.utils.LangSmithError:
             await asyncio.sleep(1**i)
 
-    if await _arun(client.run_is_shared, run_id):
-        return await _arun(client.read_run_shared_link, run_id)
-    return await _arun(client.share_run, run_id)
+    if await _arun(langsmith_client.run_is_shared, run_id):
+        return await _arun(langsmith_client.read_run_shared_link, run_id)
+    return await _arun(langsmith_client.share_run, run_id)
 
 
 class GetTraceBody(BaseModel):

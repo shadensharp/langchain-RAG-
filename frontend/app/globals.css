@@ -5,6 +5,7 @@
 body {
   color: #f8f8f8;
   background: #131318;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 body input,
