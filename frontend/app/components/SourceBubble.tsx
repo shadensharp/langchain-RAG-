@@ -1,10 +1,13 @@
 import "react-toastify/dist/ReactToastify.css";
-import { Card, CardBody, Heading } from "@chakra-ui/react";
+import { Card, CardBody, Heading, Text } from "@chakra-ui/react";
 import { sendFeedback } from "../utils/sendFeedback";
 
 export type Source = {
+  citation: number;
   url: string;
   title: string;
+  location: string;
+  excerpt: string;
 };
 
 export function SourceBubble({
@@ -42,9 +45,15 @@ export function SourceBubble({
       overflow={"hidden"}
     >
       <CardBody>
+        <Text fontSize={"xs"} color={"blue.200"} mb={2}>
+          [{source.citation}] Source
+        </Text>
         <Heading size={"sm"} fontWeight={"normal"} color={"white"}>
           {source.title}
         </Heading>
+        <Text fontSize={"xs"} color={"gray.400"} mt={2} noOfLines={1}>
+          {source.location}
+        </Text>
       </CardBody>
     </Card>
   );

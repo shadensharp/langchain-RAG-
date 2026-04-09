@@ -4,13 +4,13 @@ import React, { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useSearchParams } from "next/navigation";
 import Image from "next/image";
-import { RemoteRunnable } from "@langchain/core/runnables/remote";
+import { v4 as uuidv4 } from "uuid";
 
 import { EmptyState } from "./EmptyState";
 import { ChatMessageBubble, Message } from "./ChatMessageBubble";
 import { AutoResizeTextarea } from "./AutoResizeTextarea";
-import { marked } from "marked";
-import { Renderer } from "marked";
+import { Source } from "./SourceBubble";
+import { marked, Renderer } from "marked";
 import hljs from "highlight.js";
 import "highlight.js/styles/gradient-dark.css";
 
@@ -23,150 +23,404 @@ import {
   InputGroup,
   InputRightElement,
   Spinner,
+  Text,
+  Button,
 } from "@chakra-ui/react";
 import { ArrowUpIcon } from "@chakra-ui/icons";
 import { Select, Link } from "@chakra-ui/react";
-import { Source } from "./SourceBubble";
 import { apiBaseUrl } from "../utils/constants";
 
 const MODEL_TYPES = ["openai_gpt_3_5_turbo"];
-
 const defaultLlmValue = MODEL_TYPES[0];
+const CLIENT_ID_STORAGE_KEY = "chat-langchain:client-id:v1";
+const CONVERSATION_ID_STORAGE_KEY = "chat-langchain:conversation-id:v1";
+
+type ApprovedAnswerPreference = {
+  answer: string;
+  notes: string;
+};
+
+type AdjustmentFeedback = {
+  comment: string;
+  answer?: string;
+};
+
+type ResponsePreferences = {
+  approved_answer?: ApprovedAnswerPreference;
+  adjustment_feedback: AdjustmentFeedback[];
+};
+
+type SessionMessage = {
+  id: string;
+  role: "system" | "user" | "assistant" | "function";
+  rawContent: string;
+  runId?: string;
+  sources?: Source[];
+  status?: "pending" | "complete";
+  feedback?: {
+    rating: "good" | "bad";
+    comment?: string;
+  };
+};
+
+type SessionResponse = {
+  client_id: string;
+  conversation_id: string;
+  response_preferences: ResponsePreferences;
+  messages: SessionMessage[];
+};
+
+type ChatApiResponse = {
+  client_id: string;
+  conversation_id: string;
+  response_preferences: ResponsePreferences;
+  user_message: SessionMessage;
+  assistant_message: SessionMessage;
+};
+
+type FeedbackResponse = {
+  message_id: string;
+  response_preferences: ResponsePreferences;
+  message: SessionMessage;
+};
+
+const createDefaultResponsePreferences = (): ResponsePreferences => ({
+  adjustment_feedback: [],
+});
+
+const hasRememberedPreferences = (preferences: ResponsePreferences) =>
+  Boolean(
+    preferences.approved_answer || preferences.adjustment_feedback.length > 0,
+  );
+
+const renderMarkdown = (content: string) => {
+  const renderer = new Renderer();
+  renderer.paragraph = (text) => text + "\n";
+  renderer.list = (text) => `${text}\n\n`;
+  renderer.listitem = (text) => `\n- ${text}`;
+  renderer.code = (code, language) => {
+    const validLanguage = hljs.getLanguage(language || "")
+      ? language || "plaintext"
+      : "plaintext";
+    const highlightedCode = hljs.highlight(code, {
+      language: validLanguage,
+    }).value;
+    return `<pre class="highlight bg-gray-700" style="padding: 5px; border-radius: 5px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; max-width: 100%; display: block; line-height: 1.2"><code class="${validLanguage}" style="color: #d6e2ef; font-size: 12px;">${highlightedCode}</code></pre>`;
+  };
+
+  return marked.parse(content, { renderer }) as string;
+};
+
+const isSource = (value: unknown): value is Source => {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  return (
+    typeof (value as Source).citation === "number" &&
+    typeof (value as Source).title === "string" &&
+    typeof (value as Source).url === "string" &&
+    typeof (value as Source).location === "string" &&
+    typeof (value as Source).excerpt === "string"
+  );
+};
+
+const normalizeResponsePreferences = (value: unknown): ResponsePreferences => {
+  if (typeof value !== "object" || value === null) {
+    return createDefaultResponsePreferences();
+  }
+
+  const candidate = value as ResponsePreferences;
+  return {
+    approved_answer:
+      candidate.approved_answer &&
+      typeof candidate.approved_answer.answer === "string" &&
+      typeof candidate.approved_answer.notes === "string"
+        ? candidate.approved_answer
+        : undefined,
+    adjustment_feedback: Array.isArray(candidate.adjustment_feedback)
+      ? candidate.adjustment_feedback.filter(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            typeof (item as AdjustmentFeedback).comment === "string" &&
+            ((item as AdjustmentFeedback).answer === undefined ||
+              typeof (item as AdjustmentFeedback).answer === "string"),
+        )
+      : [],
+  };
+};
+
+const normalizeSessionMessage = (value: unknown): SessionMessage | null => {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const candidate = value as SessionMessage;
+  if (typeof candidate.id !== "string" || typeof candidate.role !== "string") {
+    return null;
+  }
+
+  const rawContent =
+    typeof candidate.rawContent === "string"
+      ? candidate.rawContent
+      : typeof (candidate as { content?: unknown }).content === "string"
+        ? String((candidate as { content?: unknown }).content)
+        : "";
+
+  const sources = Array.isArray(candidate.sources)
+    ? candidate.sources.filter(isSource)
+    : [];
+
+  return {
+    id: candidate.id,
+    role: candidate.role,
+    rawContent,
+    runId: typeof candidate.runId === "string" ? candidate.runId : undefined,
+    sources,
+    status: candidate.status === "pending" ? "pending" : "complete",
+    feedback:
+      candidate.feedback &&
+      (candidate.feedback.rating === "good" ||
+        candidate.feedback.rating === "bad")
+        ? candidate.feedback
+        : undefined,
+  };
+};
+
+const hydrateMessage = (message: SessionMessage): Message => ({
+  id: message.id,
+  role: message.role,
+  rawContent: message.rawContent,
+  content:
+    message.role === "assistant"
+      ? renderMarkdown(message.rawContent).trim()
+      : message.rawContent,
+  runId: message.runId,
+  sources: message.sources,
+  feedback: message.feedback,
+  status: message.status ?? "complete",
+});
+
+const readStoredId = (key: string, fallbackValue: string) => {
+  if (typeof window === "undefined") {
+    return fallbackValue;
+  }
+
+  try {
+    const storedValue = window.localStorage.getItem(key);
+    if (storedValue && storedValue.trim()) {
+      return storedValue;
+    }
+    window.localStorage.setItem(key, fallbackValue);
+  } catch (error) {
+    console.error(`Failed to access localStorage key ${key}:`, error);
+  }
+
+  return fallbackValue;
+};
+
+const persistStoredId = (key: string, value: string) => {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(key, value);
+};
 
 export function ChatWindow(props: { conversationId: string }) {
-  const conversationId = props.conversationId;
-
   const searchParams = useSearchParams();
-
   const messageContainerRef = useRef<HTMLDivElement | null>(null);
-  const [messages, setMessages] = useState<Array<Message>>([]);
+
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [sessionIsLoading, setSessionIsLoading] = useState(true);
+  const [clientId, setClientId] = useState("");
+  const [activeConversationId, setActiveConversationId] = useState(
+    props.conversationId,
+  );
   const [llm, setLlm] = useState(
     searchParams.get("llm") ?? "openai_gpt_3_5_turbo",
   );
   const [llmIsLoading, setLlmIsLoading] = useState(true);
+  const [responsePreferences, setResponsePreferences] =
+    useState<ResponsePreferences>(createDefaultResponsePreferences);
 
   useEffect(() => {
     setLlm(searchParams.get("llm") ?? defaultLlmValue);
     setLlmIsLoading(false);
   }, [searchParams]);
 
-  const [chatHistory, setChatHistory] = useState<
-    { human: string; ai: string }[]
-  >([]);
+  useEffect(() => {
+    const resolvedClientId = readStoredId(CLIENT_ID_STORAGE_KEY, uuidv4());
+    const resolvedConversationId = readStoredId(
+      CONVERSATION_ID_STORAGE_KEY,
+      props.conversationId,
+    );
+    setClientId(resolvedClientId);
+    setActiveConversationId(resolvedConversationId);
+  }, [props.conversationId]);
+
+  useEffect(() => {
+    if (!clientId || !activeConversationId) {
+      return;
+    }
+
+    let cancelled = false;
+    setSessionIsLoading(true);
+
+    const loadSession = async () => {
+      try {
+        const url = new URL(`${apiBaseUrl}/api/session`);
+        url.searchParams.set("client_id", clientId);
+        url.searchParams.set("conversation_id", activeConversationId);
+
+        const response = await fetch(url.toString());
+        if (!response.ok) {
+          throw new Error(`Unable to load session (${response.status})`);
+        }
+
+        const data = (await response.json()) as SessionResponse;
+        if (cancelled) {
+          return;
+        }
+
+        const normalizedMessages = Array.isArray(data.messages)
+          ? data.messages
+              .map(normalizeSessionMessage)
+              .filter((message): message is SessionMessage => message !== null)
+              .map(hydrateMessage)
+          : [];
+
+        setMessages(normalizedMessages);
+        setResponsePreferences(
+          normalizeResponsePreferences(data.response_preferences),
+        );
+      } catch (error) {
+        console.error("Failed to load session:", error);
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Failed to load the saved conversation.",
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setSessionIsLoading(false);
+        }
+      }
+    };
+
+    void loadSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId, activeConversationId]);
 
   const sendMessage = async (message?: string) => {
     if (messageContainerRef.current) {
       messageContainerRef.current.classList.add("grow");
     }
-    if (isLoading) {
+    if (isLoading || sessionIsLoading || !clientId || !activeConversationId) {
       return;
     }
+
     const messageValue = message ?? input;
     if (messageValue === "") return;
-    let messageIndex: number | null = null;
+
+    let userMessageIndex: number | null = null;
+    let assistantMessageIndex: number | null = null;
     const placeholderId = Math.random().toString();
+    const temporaryUserId = Math.random().toString();
+
     flushSync(() => {
       setInput("");
       setMessages((prevMessages) => {
-        messageIndex = prevMessages.length + 1;
+        userMessageIndex = prevMessages.length;
+        assistantMessageIndex = prevMessages.length + 1;
         return [
           ...prevMessages,
-          { id: Math.random().toString(), content: messageValue, role: "user" },
-          { id: placeholderId, content: "Thinking...", role: "assistant" },
+          { id: temporaryUserId, content: messageValue, role: "user" },
+          {
+            id: placeholderId,
+            content: "Thinking...",
+            rawContent: "Thinking...",
+            role: "assistant",
+            status: "pending",
+          },
         ];
       });
       setIsLoading(true);
     });
 
-    let accumulatedMessage = "";
-    let runId: string | undefined = undefined;
-    let sources: Source[] | undefined = undefined;
-
-    let renderer = new Renderer();
-    renderer.paragraph = (text) => {
-      return text + "\n";
-    };
-    renderer.list = (text) => {
-      return `${text}\n\n`;
-    };
-    renderer.listitem = (text) => {
-      return `\n- ${text}`;
-    };
-    renderer.code = (code, language) => {
-      const validLanguage = hljs.getLanguage(language || "")
-        ? language
-        : "plaintext";
-      const highlightedCode = hljs.highlight(
-        validLanguage || "plaintext",
-        code,
-      ).value;
-      return `<pre class="highlight bg-gray-700" style="padding: 5px; border-radius: 5px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; max-width: 100%; display: block; line-height: 1.2"><code class="${language}" style="color: #d6e2ef; font-size: 12px; ">${highlightedCode}</code></pre>`;
-    };
-    marked.setOptions({ renderer });
     try {
-      const remoteChain = new RemoteRunnable({
-        url: apiBaseUrl + "/chat",
-        options: { timeout: 180000 },
-      });
-      const llmDisplayName = llm ?? "openai_gpt_3_5_turbo";
-
-      // Use invoke() for non-streaming backends (e.g. Qwen with streaming=False).
-      // streamLog does not reliably yield output when LLM is non-streaming.
-      const invokeResult = await remoteChain.invoke(
-        {
+      const llmDisplayName = llm ?? defaultLlmValue;
+      const response = await fetch(`${apiBaseUrl}/api/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: clientId,
+          conversation_id: activeConversationId,
           question: messageValue,
-          chat_history: chatHistory,
-        },
-        {
-          configurable: { llm: llmDisplayName },
-          tags: ["model:" + llmDisplayName],
-          metadata: {
-            conversation_id: conversationId,
-            llm: llmDisplayName,
-          },
-        },
+          llm: llmDisplayName,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `Request failed (${response.status})`);
+      }
+
+      const data = (await response.json()) as ChatApiResponse;
+      const userMessage = normalizeSessionMessage(data.user_message);
+      const assistantMessage = normalizeSessionMessage(data.assistant_message);
+
+      if (userMessage === null || assistantMessage === null) {
+        throw new Error("Backend returned an invalid message payload.");
+      }
+
+      setResponsePreferences(
+        normalizeResponsePreferences(data.response_preferences),
       );
-      accumulatedMessage =
-        typeof invokeResult === "string"
-          ? invokeResult
-          : String(invokeResult ?? "");
-      const parsedResult = marked.parse(accumulatedMessage);
 
       setMessages((prevMessages) => {
-        const newMessages = [...prevMessages];
-        const idx =
-          messageIndex !== null && newMessages[messageIndex] !== undefined
-            ? messageIndex
-            : newMessages.length;
-        if (newMessages[idx]?.role === "assistant") {
-          newMessages[idx] = {
-            ...newMessages[idx],
-            content: parsedResult.trim(),
-            runId: runId,
-            sources: sources,
-          };
-        } else {
-          newMessages.push({
-            id: Math.random().toString(),
-            content: parsedResult.trim(),
-            runId: runId,
-            sources: sources,
-            role: "assistant",
-          });
-        }
-        return newMessages;
-      });
+        const nextMessages = [...prevMessages];
 
-      setChatHistory((prevChatHistory) => [
-        ...prevChatHistory,
-        { human: messageValue, ai: accumulatedMessage },
-      ]);
+        if (
+          userMessageIndex !== null &&
+          nextMessages[userMessageIndex]?.role === "user"
+        ) {
+          nextMessages[userMessageIndex] = {
+            ...nextMessages[userMessageIndex],
+            id: userMessage.id,
+            rawContent: userMessage.rawContent,
+          };
+        }
+
+        const hydratedAssistantMessage = hydrateMessage(assistantMessage);
+        if (
+          assistantMessageIndex !== null &&
+          nextMessages[assistantMessageIndex]?.role === "assistant"
+        ) {
+          nextMessages[assistantMessageIndex] = hydratedAssistantMessage;
+        } else {
+          nextMessages.push(hydratedAssistantMessage);
+        }
+
+        return nextMessages;
+      });
       setIsLoading(false);
     } catch (e) {
       setMessages((prevMessages) =>
-        prevMessages.filter((message) => message.id !== placeholderId),
+        prevMessages.filter(
+          (chatMessage) =>
+            chatMessage.id !== placeholderId && chatMessage.id !== temporaryUserId,
+        ),
       );
       setIsLoading(false);
       setInput(messageValue);
@@ -185,18 +439,126 @@ export function ChatWindow(props: { conversationId: string }) {
 
   const insertUrlParam = (key: string, value?: string) => {
     if (window.history.pushState) {
-      const searchParams = new URLSearchParams(window.location.search);
-      searchParams.set(key, value ?? "");
-      const newurl =
+      const params = new URLSearchParams(window.location.search);
+      params.set(key, value ?? "");
+      const newUrl =
         window.location.protocol +
         "//" +
         window.location.host +
         window.location.pathname +
         "?" +
-        searchParams.toString();
-      window.history.pushState({ path: newurl }, "", newurl);
+        params.toString();
+      window.history.pushState({ path: newUrl }, "", newUrl);
     }
   };
+
+  const applyPositiveFeedback = async (messageId: string) => {
+    const response = await fetch(`${apiBaseUrl}/api/message_feedback`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        client_id: clientId,
+        message_id: messageId,
+        rating: "good",
+      }),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || `Feedback failed (${response.status})`);
+    }
+
+    const data = (await response.json()) as FeedbackResponse;
+    setResponsePreferences(
+      normalizeResponsePreferences(data.response_preferences),
+    );
+    setMessages((prevMessages) =>
+      prevMessages.map((message) =>
+        message.id === messageId
+          ? {
+              ...message,
+              feedback: {
+                rating: "good",
+              },
+            }
+          : message,
+      ),
+    );
+  };
+
+  const applyNegativeFeedback = async (messageId: string, comment: string) => {
+    const response = await fetch(`${apiBaseUrl}/api/message_feedback`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        client_id: clientId,
+        message_id: messageId,
+        rating: "bad",
+        comment,
+      }),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || `Feedback failed (${response.status})`);
+    }
+
+    const data = (await response.json()) as FeedbackResponse;
+    setResponsePreferences(
+      normalizeResponsePreferences(data.response_preferences),
+    );
+    setMessages((prevMessages) =>
+      prevMessages.map((message) =>
+        message.id === messageId
+          ? {
+              ...message,
+              feedback: {
+                rating: "bad",
+                comment,
+              },
+            }
+          : message,
+      ),
+    );
+  };
+
+  const resetStyleMemory = async () => {
+    if (!clientId) {
+      return;
+    }
+
+    const response = await fetch(
+      `${apiBaseUrl}/api/response_preferences/${clientId}`,
+      {
+        method: "DELETE",
+      },
+    );
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || `Reset failed (${response.status})`);
+    }
+
+    const data = (await response.json()) as {
+      response_preferences: ResponsePreferences;
+    };
+    setResponsePreferences(
+      normalizeResponsePreferences(data.response_preferences),
+    );
+    toast.success("Style memory cleared.");
+  };
+
+  const startNewConversation = () => {
+    const nextConversationId = uuidv4();
+    persistStoredId(CONVERSATION_ID_STORAGE_KEY, nextConversationId);
+    setActiveConversationId(nextConversationId);
+    setMessages([]);
+    setInput("");
+  };
+
+  const rememberedPreferencesAreActive =
+    hasRememberedPreferences(responsePreferences);
 
   return (
     <div className="flex flex-col items-center p-8 rounded grow max-h-full">
@@ -211,12 +573,14 @@ export function ChatWindow(props: { conversationId: string }) {
           mb={1}
           color={"white"}
         >
-          Chat LangChain 🦜🔗
+          Chat LangChain
         </Heading>
         {messages.length > 0 ? (
-          <Heading fontSize="md" fontWeight={"normal"} mb={1} color={"white"}>
-            We appreciate feedback!
-          </Heading>
+          <Text fontSize="sm" mb={1} color={"gray.300"} textAlign={"center"}>
+            `Good` keeps the current response style. `Bad` stores written
+            feedback on the backend and adjusts later answers. `Trace` shows the
+            linked source pages and retrieved excerpts behind the answer.
+          </Text>
         ) : (
           <Heading
             fontSize="xl"
@@ -231,7 +595,7 @@ export function ChatWindow(props: { conversationId: string }) {
             </Link>
           </Heading>
         )}
-        <div className="text-white flex flex-wrap items-center mt-4">
+        <div className="text-white flex flex-wrap items-center justify-center mt-4 gap-3">
           <div className="flex items-center mb-2">
             <span className="shrink-0 mr-2">Powered by</span>
             {llmIsLoading ? (
@@ -249,24 +613,53 @@ export function ChatWindow(props: { conversationId: string }) {
               </Select>
             )}
           </div>
+          <div className="flex items-center gap-2 mb-2">
+            <Button size="xs" variant="outline" onClick={startNewConversation}>
+              New Chat
+            </Button>
+            {rememberedPreferencesAreActive && (
+              <>
+                <Text fontSize="sm" color="green.200">
+                  Backend style memory is active.
+                </Text>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => {
+                    void resetStyleMemory().catch((error) => {
+                      console.error("Failed to reset style memory:", error);
+                      toast.error(
+                        error instanceof Error
+                          ? error.message
+                          : "Failed to reset style memory.",
+                      );
+                    });
+                  }}
+                >
+                  Reset Style Memory
+                </Button>
+              </>
+            )}
+          </div>
         </div>
       </Flex>
       <div
         className="flex flex-col-reverse w-full mb-2 overflow-auto"
         ref={messageContainerRef}
       >
-        {messages.length > 0 ? (
-          [...messages]
-            .reverse()
-            .map((m, index) => (
-              <ChatMessageBubble
-                key={m.id}
-                message={{ ...m }}
-                aiEmoji="🦜"
-                isMostRecent={index === 0}
-                messageCompleted={!isLoading}
-              ></ChatMessageBubble>
-            ))
+        {sessionIsLoading ? (
+          <div className="w-full flex justify-center py-10">
+            <Spinner color="white" />
+          </div>
+        ) : messages.length > 0 ? (
+          [...messages].reverse().map((message) => (
+            <ChatMessageBubble
+              key={message.id}
+              message={{ ...message }}
+              onApproveResponse={applyPositiveFeedback}
+              onRejectResponse={applyNegativeFeedback}
+            />
+          ))
         ) : (
           <EmptyState onChoice={sendInitialQuestion} />
         )}
@@ -276,7 +669,7 @@ export function ChatWindow(props: { conversationId: string }) {
           value={input}
           maxRows={5}
           marginRight={"56px"}
-          placeholder="What does RunnablePassthrough.assign() do?"
+          placeholder="Example: What does RunnablePassthrough.assign() do?"
           color={"white"}
           bg={"rgba(255, 255, 255, 0.06)"}
           borderColor={"rgb(58, 58, 61)"}
@@ -294,7 +687,7 @@ export function ChatWindow(props: { conversationId: string }) {
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              sendMessage();
+              void sendMessage();
             } else if (e.key === "Enter" && e.shiftKey) {
               e.preventDefault();
               setInput(input + "\n");
@@ -308,9 +701,10 @@ export function ChatWindow(props: { conversationId: string }) {
             aria-label="Send"
             icon={isLoading ? <Spinner /> : <ArrowUpIcon />}
             type="submit"
+            isDisabled={sessionIsLoading}
             onClick={(e) => {
               e.preventDefault();
-              sendMessage();
+              void sendMessage();
             }}
           />
         </InputRightElement>

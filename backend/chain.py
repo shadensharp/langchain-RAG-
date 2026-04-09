@@ -2,6 +2,7 @@ from functools import lru_cache
 import os
 from operator import itemgetter
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import unquote, urlparse
 
 import weaviate
 from fastapi import FastAPI
@@ -49,8 +50,8 @@ RESPONSE_TEMPLATE = """\
 You are an expert programmer and problem-solver, tasked with answering any question \
 about Langchain.
 
-Generate a comprehensive and informative answer of 80 words or less for the \
-given question based solely on the provided search results (URL and content). You must \
+Generate a concise and informative answer for the given question based solely on \
+the provided search results (URL and content). You must \
 only use information from the provided search results. Use an unbiased and \
 journalistic tone. Combine search results together into a coherent answer. Do not \
 repeat text. Cite search results using [number] notation. Only cite the most \
@@ -59,8 +60,9 @@ of the sentence or paragraph that reference them - do not put them all at the en
 different results refer to different entities within the same name, write separate \
 answers for each entity.
 
-You should use bullet points in your answer for readability. Put citations where they apply
-rather than putting them all at the end.
+Respond in the same language as the user's latest question unless the user's style \
+preferences explicitly ask for a different language. Keep the answer easy to scan. \
+If bullets help, use them. If a short paragraph is clearer, use that instead.
 
 If there is nothing in the context relevant to the question at hand, just say "Hmm, \
 I'm not sure." Don't try to make up an answer.
@@ -82,8 +84,8 @@ COHERE_RESPONSE_TEMPLATE = """\
 You are an expert programmer and problem-solver, tasked with answering any question \
 about Langchain.
 
-Generate a comprehensive and informative answer of 80 words or less for the \
-given question based solely on the provided search results (URL and content). You must \
+Generate a concise and informative answer for the given question based solely on \
+the provided search results (URL and content). You must \
 only use information from the provided search results. Use an unbiased and \
 journalistic tone. Combine search results together into a coherent answer. Do not \
 repeat text. Cite search results using [number] notation. Only cite the most \
@@ -92,8 +94,9 @@ of the sentence or paragraph that reference them - do not put them all at the en
 different results refer to different entities within the same name, write separate \
 answers for each entity.
 
-You should use bullet points in your answer for readability. Put citations where they apply
-rather than putting them all at the end.
+Respond in the same language as the user's latest question unless the user's style \
+preferences explicitly ask for a different language. Keep the answer easy to scan. \
+If bullets help, use them. If a short paragraph is clearer, use that instead.
 
 If there is nothing in the context relevant to the question at hand, just say "Hmm, \
 I'm not sure." Don't try to make up an answer.
@@ -113,6 +116,14 @@ Chat History:
 Follow Up Input: {question}
 Standalone Question:"""
 
+STYLE_GUIDANCE_TEMPLATE = """\
+These user preferences only affect response style, wording, tone, and structure. \
+They are never additional facts or evidence. Follow them when they do not conflict \
+with the retrieved documents.
+
+{response_style_instructions}\
+"""
+
 
 app = FastAPI()
 app.add_middleware(
@@ -128,6 +139,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     question: str
     chat_history: Optional[List[Dict[str, str]]]
+    response_preferences: Optional[Dict[str, object]] = None
 
 
 def _require_env(*names: str) -> tuple[str, ...]:
@@ -194,10 +206,60 @@ def create_retriever_chain(
 
 def format_docs(docs: Sequence[Document]) -> str:
     formatted_docs = []
-    for i, doc in enumerate(docs):
-        doc_string = f"<doc id='{i}'>{doc.page_content}</doc>"
+    for i, doc in enumerate(docs, start=1):
+        title = (doc.metadata.get("title") or "").strip()
+        source = (doc.metadata.get("source") or "").strip()
+        doc_string = (
+            f"<doc id='{i}'>\n"
+            f"<title>{title}</title>\n"
+            f"<source>{source}</source>\n"
+            f"<content>{doc.page_content}</content>\n"
+            "</doc>"
+        )
         formatted_docs.append(doc_string)
     return "\n".join(formatted_docs)
+
+
+def _truncate_text(text: str, limit: int = 280) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def _format_source_location(url: str, title: str, citation: int) -> str:
+    if not url:
+        return title or f"Source {citation}"
+
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "").rstrip("/")
+    path_tail = path.split("/")[-1] if path else parsed.netloc
+    fragment = unquote(parsed.fragment or "").strip()
+
+    if fragment and path_tail:
+        return f"{path_tail}#{fragment}"
+    if fragment:
+        return f"#{fragment}"
+    if path_tail:
+        return path_tail
+    return title or url
+
+
+def serialize_sources(docs: Sequence[Document]) -> List[Dict[str, str | int]]:
+    serialized = []
+    for i, doc in enumerate(docs, start=1):
+        url = (doc.metadata.get("source") or "").strip()
+        title = (doc.metadata.get("title") or "").strip() or url or f"Source {i}"
+        serialized.append(
+            {
+                "citation": i,
+                "title": title,
+                "url": url,
+                "location": _format_source_location(url, title, i),
+                "excerpt": _truncate_text(doc.page_content),
+            }
+        )
+    return serialized
 
 
 def serialize_history(request: ChatRequest):
@@ -209,6 +271,42 @@ def serialize_history(request: ChatRequest):
         if message.get("ai") is not None:
             converted_chat_history.append(AIMessage(content=message["ai"]))
     return converted_chat_history
+
+
+def serialize_response_preferences(request: ChatRequest) -> str:
+    response_preferences = request.get("response_preferences") or {}
+    lines: List[str] = []
+
+    approved_answer = response_preferences.get("approved_answer")
+    if isinstance(approved_answer, dict):
+        answer = str(approved_answer.get("answer") or "").strip()
+        notes = str(approved_answer.get("notes") or "").strip()
+        if notes:
+            lines.append(f"- Keep these approved style notes in mind: {notes}")
+        if answer:
+            lines.append(
+                "- The user explicitly liked this previous answer style. Reuse its "
+                f"tone, structure, and level of detail when appropriate:\n{answer}"
+            )
+
+    adjustment_feedback = response_preferences.get("adjustment_feedback") or []
+    if isinstance(adjustment_feedback, list):
+        for item in adjustment_feedback[-5:]:
+            if not isinstance(item, dict):
+                continue
+            feedback = str(item.get("comment") or "").strip()
+            answer = str(item.get("answer") or "").strip()
+            if feedback:
+                lines.append(f"- Avoid repeating this issue from user feedback: {feedback}")
+            if answer:
+                lines.append(
+                    "- This was the answer the user wanted adjusted. Treat it only as "
+                    f"style context, not as factual evidence:\n{answer}"
+                )
+
+    if not lines:
+        return "- No extra style preferences were provided for this turn."
+    return "\n".join(lines)
 
 
 def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
@@ -224,6 +322,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", RESPONSE_TEMPLATE),
+            ("system", STYLE_GUIDANCE_TEMPLATE),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{question}"),
         ]
@@ -233,6 +332,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     cohere_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", COHERE_RESPONSE_TEMPLATE),
+            ("system", STYLE_GUIDANCE_TEMPLATE),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{question}"),
         ]
@@ -254,9 +354,21 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         | StrOutputParser()
     ).with_config(run_name="GenerateResponse")
     return (
-        RunnablePassthrough.assign(chat_history=serialize_history)
+        RunnablePassthrough.assign(
+            chat_history=serialize_history,
+            response_style_instructions=serialize_response_preferences,
+        )
         | context
-        | response_synthesizer
+        | RunnablePassthrough.assign(
+            answer=response_synthesizer,
+            sources=lambda x: serialize_sources(x["docs"]),
+        )
+        | RunnableLambda(
+            lambda x: {
+                "answer": x["answer"],
+                "sources": x["sources"],
+            }
+        ).with_config(run_name="FormatChatResponse")
     )
 
 

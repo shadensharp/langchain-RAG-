@@ -89,3 +89,36 @@ gcloud run deploy chat-langchain --source . --port 8000 --env-vars-file .env.gcp
 ```
 
 Finally, go back to Vercel and add an environment variable `NEXT_PUBLIC_API_BASE_URL` to match your Cloud Run URL.
+
+## Public Access Notes
+
+To let external users open the site from their own computers, both the frontend and backend must be reachable on the public internet.
+
+- Frontend: deploy the `frontend/` app to Vercel or another public host.
+- Backend: deploy the FastAPI app to a public service such as Cloud Run, ECS, or a VM with HTTPS and a public domain.
+- Frontend API base URL: set `NEXT_PUBLIC_API_BASE_URL` to the deployed backend URL.
+- Backend CORS: set `BACKEND_CORS_ORIGINS` to the public frontend origin instead of relying on wildcard development settings.
+
+## Backend Persistence
+
+The app now stores chat sessions, assistant messages, feedback, and response-style preferences on the backend.
+
+- Use `APP_PERSISTENCE_DB_URL` for this data store.
+- For production, use PostgreSQL. Do not use local SQLite for multi-user cloud deployments.
+- Example:
+
+```dotenv
+APP_PERSISTENCE_DB_URL=postgresql://user:password@host:5432/chat_langchain
+BACKEND_CORS_ORIGINS=https://your-frontend-domain.vercel.app
+```
+
+## Local Network Access
+
+For LAN testing before public deployment:
+
+```powershell
+powershell -File _scripts/run_backend.ps1 -ListenHost 0.0.0.0 -Port 8080
+powershell -File _scripts/run_frontend_dev.ps1 -ListenHost 0.0.0.0 -Port 3000
+```
+
+This only exposes the app on your current network. Public internet access still requires deployment plus DNS, HTTPS, and firewall configuration.

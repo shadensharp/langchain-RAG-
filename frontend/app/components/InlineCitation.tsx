@@ -13,13 +13,14 @@ export function InlineCitation(props: {
     <a
       href={source.url}
       target="_blank"
+      rel="noreferrer"
       className={`relative bottom-1.5 text-xs border rounded px-1 ${
         highlighted ? "bg-[rgb(58,58,61)]" : "bg-[rgb(78,78,81)]"
       }`}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
-      {sourceNumber}
+      [{sourceNumber}]
     </a>
   );
 }

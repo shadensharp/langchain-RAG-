@@ -1,7 +1,6 @@
+import { useEffect, useState } from "react";
 import { toast } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
-import { emojisplosion } from "emojisplosion";
-import { useState, useRef } from "react";
 import { SourceBubble, Source } from "./SourceBubble";
 import {
   VStack,
@@ -12,251 +11,204 @@ import {
   Button,
   Divider,
   Spacer,
+  Link,
+  Modal,
+  ModalOverlay,
+  ModalContent,
+  ModalHeader,
+  ModalCloseButton,
+  ModalBody,
+  ModalFooter,
+  Text,
+  Textarea,
 } from "@chakra-ui/react";
-import { sendFeedback } from "../utils/sendFeedback";
-import { apiBaseUrl } from "../utils/constants";
 import { InlineCitation } from "./InlineCitation";
+
+export type MessageFeedback = {
+  rating: "good" | "bad";
+  comment?: string;
+};
 
 export type Message = {
   id: string;
   createdAt?: Date;
   content: string;
+  rawContent?: string;
   role: "system" | "user" | "assistant" | "function";
   runId?: string;
   sources?: Source[];
   name?: string;
+  status?: "pending" | "complete";
+  feedback?: MessageFeedback;
   function_call?: { name: string };
 };
-export type Feedback = {
-  feedback_id: string;
-  run_id: string;
-  key: string;
-  score: number;
-  comment?: string;
-};
 
-const filterSources = (sources: Source[]) => {
-  const filtered: Source[] = [];
-  const urlMap = new Map<string, number>();
-  const indexMap = new Map<number, number>();
-  sources.forEach((source, i) => {
-    const { url } = source;
-    const index = urlMap.get(url);
-    if (index === undefined) {
-      urlMap.set(url, i);
-      indexMap.set(i, filtered.length);
-      filtered.push(source);
-    } else {
-      const resolvedIndex = indexMap.get(index);
-      if (resolvedIndex !== undefined) {
-        indexMap.set(i, resolvedIndex);
-      }
-    }
-  });
-  return { filtered, indexMap };
-};
+const CITATION_PATTERN = /\[\^?\$?{?(\d+)}?\^?\]/g;
+const EMPTY_SOURCES: Source[] = [];
 
 const createAnswerElements = (
   content: string,
-  filteredSources: Source[],
-  sourceIndexMap: Map<number, number>,
-  highlighedSourceLinkStates: boolean[],
+  sources: Source[],
+  highlightedSourceLinkStates: boolean[],
   setHighlightedSourceLinkStates: React.Dispatch<
     React.SetStateAction<boolean[]>
   >,
 ) => {
-  const matches = Array.from(content.matchAll(/\[\^?\$?{?(\d+)}?\^?\]/g));
+  const matches = Array.from(content.matchAll(CITATION_PATTERN));
   const elements: JSX.Element[] = [];
   let prevIndex = 0;
 
   matches.forEach((match) => {
     const sourceNum = parseInt(match[1], 10);
-    const resolvedNum = sourceIndexMap.get(sourceNum) ?? 10;
-    if (match.index !== null && resolvedNum < filteredSources.length) {
+    const sourceIndex = sourceNum - 1;
+    const source = sources[sourceIndex];
+    const matchIndex = match.index;
+    if (matchIndex !== undefined && source !== undefined) {
       elements.push(
         <span
           key={`content:${prevIndex}`}
           dangerouslySetInnerHTML={{
-            __html: content.slice(prevIndex, match.index),
+            __html: content.slice(prevIndex, matchIndex),
           }}
         ></span>,
       );
       elements.push(
         <InlineCitation
           key={`citation:${prevIndex}`}
-          source={filteredSources[resolvedNum]}
-          sourceNumber={resolvedNum}
-          highlighted={highlighedSourceLinkStates[resolvedNum]}
+          source={source}
+          sourceNumber={sourceNum}
+          highlighted={highlightedSourceLinkStates[sourceIndex] ?? false}
           onMouseEnter={() =>
             setHighlightedSourceLinkStates(
-              filteredSources.map((_, i) => i === resolvedNum),
+              sources.map((_, index) => index === sourceIndex),
             )
           }
           onMouseLeave={() =>
-            setHighlightedSourceLinkStates(filteredSources.map(() => false))
+            setHighlightedSourceLinkStates(sources.map(() => false))
           }
         />,
       );
-      prevIndex = (match?.index ?? 0) + match[0].length;
+      prevIndex = matchIndex + match[0].length;
     }
   });
+
   elements.push(
     <span
       key={`content:${prevIndex}`}
       dangerouslySetInnerHTML={{
-        __html: content.slice(prevIndex)
+        __html: content.slice(prevIndex),
       }}
     ></span>,
   );
+
   return elements;
+};
+
+const getTraceSources = (content: string, sources: Source[]) => {
+  const citedSources: Source[] = [];
+  const seen = new Set<number>();
+
+  for (const match of Array.from(content.matchAll(CITATION_PATTERN))) {
+    const citation = parseInt(match[1], 10);
+    const source = sources[citation - 1];
+    if (source !== undefined && !seen.has(citation)) {
+      seen.add(citation);
+      citedSources.push(source);
+    }
+  }
+
+  return citedSources.length > 0 ? citedSources : sources;
 };
 
 export function ChatMessageBubble(props: {
   message: Message;
-  aiEmoji?: string;
-  isMostRecent: boolean;
-  messageCompleted: boolean;
+  onApproveResponse: (messageId: string) => Promise<void>;
+  onRejectResponse: (messageId: string, comment: string) => Promise<void>;
 }) {
-  const { role, content, runId } = props.message;
+  const { role, content, runId, status, feedback } = props.message;
   const isUser = role === "user";
-  const [isLoading, setIsLoading] = useState(false);
-  const [traceIsLoading, setTraceIsLoading] = useState(false);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [comment, setComment] = useState("");
-  const [feedbackColor, setFeedbackColor] = useState("");
-  const upButtonRef = useRef(null);
-  const downButtonRef = useRef(null);
+  const sources = props.message.sources ?? EMPTY_SOURCES;
 
-  const cumulativeOffset = function (element: HTMLElement | null) {
-    var top = 0,
-      left = 0;
-    do {
-      top += element?.offsetTop || 0;
-      left += element?.offsetLeft || 0;
-      element = (element?.offsetParent as HTMLElement) || null;
-    } while (element);
-
-    return {
-      top: top,
-      left: left,
-    };
-  };
-
-  const sendUserFeedback = async (score: number, key: string) => {
-    let run_id = runId;
-    if (run_id === undefined) {
-      return;
-    }
-    if (isLoading) {
-      return;
-    }
-    setIsLoading(true);
-    try {
-      const data = await sendFeedback({
-        score,
-        runId: run_id,
-        key,
-        feedbackId: feedback?.feedback_id,
-        comment,
-        isExplicit: true,
-      });
-      if (data.code === 200) {
-        setFeedback({ run_id, score, key, feedback_id: data.feedbackId });
-        score == 1 ? animateButton("upButton") : animateButton("downButton");
-        if (comment) {
-          setComment("");
-        }
-      }
-    } catch (e: any) {
-      console.error("Error:", e);
-      toast.error(e.message);
-    }
-    setIsLoading(false);
-  };
-  const viewTrace = async () => {
-    try {
-      setTraceIsLoading(true);
-      const response = await fetch(apiBaseUrl + "/get_trace", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          run_id: runId,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (data.code === 400) {
-        toast.error("Unable to view trace");
-        throw new Error("Unable to view trace");
-      } else {
-        const url = data.replace(/['"]+/g, "");
-        window.open(url, "_blank");
-        setTraceIsLoading(false);
-      }
-    } catch (e: any) {
-      console.error("Error:", e);
-      setTraceIsLoading(false);
-      toast.error(e.message);
-    }
-  };
-
-  const sources = props.message.sources ?? [];
-  const { filtered: filteredSources, indexMap: sourceIndexMap } =
-    filterSources(sources);
-
-  // Use an array of highlighted states as a state since React
-  // complains when creating states in a loop
-  const [highlighedSourceLinkStates, setHighlightedSourceLinkStates] = useState(
-    filteredSources.map(() => false),
+  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
+  const [badFeedbackIsOpen, setBadFeedbackIsOpen] = useState(false);
+  const [traceIsOpen, setTraceIsOpen] = useState(false);
+  const [feedbackComment, setFeedbackComment] = useState(feedback?.comment ?? "");
+  const [highlightedSourceLinkStates, setHighlightedSourceLinkStates] = useState(
+    sources.map(() => false),
   );
+
+  useEffect(() => {
+    setFeedbackComment(feedback?.comment ?? "");
+  }, [feedback?.comment]);
+
+  useEffect(() => {
+    setHighlightedSourceLinkStates(sources.map(() => false));
+  }, [sources]);
+
+  const answerText = props.message.rawContent ?? content;
   const answerElements =
     role === "assistant"
       ? createAnswerElements(
           content,
-          filteredSources,
-          sourceIndexMap,
-          highlighedSourceLinkStates,
+          sources,
+          highlightedSourceLinkStates,
           setHighlightedSourceLinkStates,
         )
       : [];
+  const traceSources = getTraceSources(answerText, sources);
+  const canLeaveFeedback = !isUser && status === "complete";
 
-  const animateButton = (buttonId: string) => {
-    let button: HTMLButtonElement | null;
-    if (buttonId === "upButton") {
-      button = upButtonRef.current;
-    } else if (buttonId === "downButton") {
-      button = downButtonRef.current;
-    } else {
+  const handleApprove = async () => {
+    if (feedback !== undefined) {
+      toast.error("This response already has feedback.");
       return;
     }
-    if (!button) return;
-    let resolvedButton = button as HTMLButtonElement;
-    resolvedButton.classList.add("animate-ping");
-    setTimeout(() => {
-      resolvedButton.classList.remove("animate-ping");
-    }, 500);
 
-    emojisplosion({
-      emojiCount: 10,
-      uniqueness: 1,
-      position() {
-        const offset = cumulativeOffset(button);
+    setIsSubmittingFeedback(true);
+    try {
+      await props.onApproveResponse(props.message.id);
+    } catch (error) {
+      console.error("Failed to save positive feedback:", error);
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save feedback.",
+      );
+    } finally {
+      setIsSubmittingFeedback(false);
+    }
+  };
 
-        return {
-          x: offset.left + resolvedButton.clientWidth / 2,
-          y: offset.top + resolvedButton.clientHeight / 2,
-        };
-      },
-      emojis: buttonId === "upButton" ? ["👍"] : ["👎"],
-    });
+  const handleOpenBadFeedback = () => {
+    if (feedback !== undefined) {
+      toast.error("This response already has feedback.");
+      return;
+    }
+    setBadFeedbackIsOpen(true);
+  };
+
+  const handleSubmitBadFeedback = async () => {
+    const trimmedComment = feedbackComment.trim();
+    if (!trimmedComment) {
+      toast.error("Please describe what should change.");
+      return;
+    }
+
+    setIsSubmittingFeedback(true);
+    try {
+      await props.onRejectResponse(props.message.id, trimmedComment);
+      setBadFeedbackIsOpen(false);
+    } catch (error) {
+      console.error("Failed to save negative feedback:", error);
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save feedback.",
+      );
+    } finally {
+      setIsSubmittingFeedback(false);
+    }
   };
 
   return (
-    <VStack align="start" spacing={5} pb={5}>
-      {!isUser && filteredSources.length > 0 && (
+    <VStack align="start" spacing={5} pb={5} width="100%">
+      {!isUser && sources.length > 0 && (
         <>
           <Flex direction={"column"} width={"100%"}>
             <VStack spacing={"5px"} align={"start"} width={"100%"}>
@@ -270,20 +222,24 @@ export function ChatMessageBubble(props: {
                 Sources
               </Heading>
               <HStack spacing={"10px"} maxWidth={"100%"} overflow={"auto"}>
-                {filteredSources.map((source, index) => (
-                  <Box key={index} alignSelf={"stretch"} width={40}>
+                {sources.map((source, index) => (
+                  <Box
+                    key={`${source.citation}:${source.url}`}
+                    alignSelf={"stretch"}
+                    width={56}
+                  >
                     <SourceBubble
                       source={source}
-                      highlighted={highlighedSourceLinkStates[index]}
+                      highlighted={highlightedSourceLinkStates[index] ?? false}
                       onMouseEnter={() =>
                         setHighlightedSourceLinkStates(
-                          filteredSources.map((_, i) => i === index),
+                          sources.map(
+                            (_, sourceIndex) => sourceIndex === index,
+                          ),
                         )
                       }
                       onMouseLeave={() =>
-                        setHighlightedSourceLinkStates(
-                          filteredSources.map(() => false),
-                        )
+                        setHighlightedSourceLinkStates(sources.map(() => false))
                       }
                       runId={runId}
                     />
@@ -309,63 +265,156 @@ export function ChatMessageBubble(props: {
         </Box>
       )}
 
-      {props.message.role !== "user" &&
-        props.isMostRecent &&
-        props.messageCompleted && (
-          <HStack spacing={2}>
-            <Button
-              ref={upButtonRef}
-              size="sm"
-              variant="outline"
-              colorScheme={feedback === null ? "green" : "gray"}
-              onClick={() => {
-                if (feedback === null && props.message.runId) {
-                  sendUserFeedback(1, "user_score");
-                  animateButton("upButton");
-                  setFeedbackColor("border-4 border-green-300");
-                } else {
-                  toast.error("You have already provided your feedback.");
-                }
-              }}
-            >
-              👍
-            </Button>
-            <Button
-              ref={downButtonRef}
-              size="sm"
-              variant="outline"
-              colorScheme={feedback === null ? "red" : "gray"}
-              onClick={() => {
-                if (feedback === null && props.message.runId) {
-                  sendUserFeedback(0, "user_score");
-                  animateButton("downButton");
-                  setFeedbackColor("border-4 border-red-300");
-                } else {
-                  toast.error("You have already provided your feedback.");
-                }
-              }}
-            >
-              👎
-            </Button>
-            <Spacer />
-            <Button
-              size="sm"
-              variant="outline"
-              colorScheme={runId === null ? "blue" : "gray"}
-              onClick={(e) => {
-                e.preventDefault();
-                viewTrace();
-              }}
-              isLoading={traceIsLoading}
-              loadingText="🔄"
-              color="white"
-            >
-              🦜🛠️ View trace
-            </Button>
-          </HStack>
-        )}
+      {canLeaveFeedback && (
+        <HStack spacing={2} width="100%" alignItems="center">
+          <Button
+            size="sm"
+            variant={feedback?.rating === "good" ? "solid" : "outline"}
+            colorScheme={feedback ? "gray" : "green"}
+            onClick={handleApprove}
+            isLoading={isSubmittingFeedback}
+            isDisabled={feedback !== undefined}
+          >
+            Good
+          </Button>
+          <Button
+            size="sm"
+            variant={feedback?.rating === "bad" ? "solid" : "outline"}
+            colorScheme={feedback ? "gray" : "orange"}
+            onClick={handleOpenBadFeedback}
+            isDisabled={feedback !== undefined}
+          >
+            Bad
+          </Button>
+          <Spacer />
+          <Button
+            size="sm"
+            variant="outline"
+            color="white"
+            onClick={() => setTraceIsOpen(true)}
+            isDisabled={traceSources.length === 0}
+          >
+            Trace
+          </Button>
+        </HStack>
+      )}
+
+      {!isUser && feedback?.rating === "good" && (
+        <Text fontSize="sm" color="green.300">
+          Saved. Later answers will try to continue this response style.
+        </Text>
+      )}
+
+      {!isUser && feedback?.rating === "bad" && (
+        <Text fontSize="sm" color="orange.300">
+          Saved. Later answers will adapt to your feedback.
+        </Text>
+      )}
 
       {!isUser && <Divider mt={4} mb={4} />}
+
+      <Modal isOpen={badFeedbackIsOpen} onClose={() => setBadFeedbackIsOpen(false)}>
+        <ModalOverlay />
+        <ModalContent backgroundColor={"rgb(38, 38, 41)"} color="white">
+          <ModalHeader>Add Feedback</ModalHeader>
+          <ModalCloseButton />
+          <ModalBody>
+            <Text fontSize="sm" color="gray.300" mb={3}>
+              Describe what should change in future answers. This can include
+              language, tone, structure, or wording habits.
+            </Text>
+            <Textarea
+              value={feedbackComment}
+              onChange={(event) => setFeedbackComment(event.target.value)}
+              minH="140px"
+              placeholder="Example: Use Chinese, start with the conclusion, and keep the wording plain."
+              bg={"rgba(255, 255, 255, 0.06)"}
+              borderColor={"rgb(80, 80, 84)"}
+              _focus={{
+                borderColor: "blue.400",
+                boxShadow: "0 0 0 1px #4299E1",
+              }}
+            />
+          </ModalBody>
+          <ModalFooter>
+            <Button variant="ghost" mr={3} onClick={() => setBadFeedbackIsOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              colorScheme="orange"
+              onClick={handleSubmitBadFeedback}
+              isLoading={isSubmittingFeedback}
+            >
+              Save Feedback
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
+
+      <Modal isOpen={traceIsOpen} onClose={() => setTraceIsOpen(false)} size="3xl">
+        <ModalOverlay />
+        <ModalContent backgroundColor={"rgb(38, 38, 41)"} color="white">
+          <ModalHeader>Answer Trace</ModalHeader>
+          <ModalCloseButton />
+          <ModalBody>
+            <Text fontSize="sm" color="gray.300" mb={4}>
+              These are the cited or retrieved source chunks behind this answer,
+              including their document location, original link, and retrieved
+              excerpt.
+            </Text>
+            <VStack spacing={4} align="stretch">
+              {traceSources.map((source) => (
+                <Box
+                  key={`${source.citation}:${source.url}`}
+                  borderWidth="1px"
+                  borderColor="rgba(255,255,255,0.12)"
+                  borderRadius="md"
+                  p={4}
+                  bg="rgba(255, 255, 255, 0.04)"
+                >
+                  <Text fontSize="sm" color="blue.200" mb={2}>
+                    [{source.citation}] {source.title}
+                  </Text>
+                  <Text fontSize="xs" color="gray.400" mb={2}>
+                    Document location
+                  </Text>
+                  <Text fontSize="sm" color="gray.100" mb={3}>
+                    {source.location}
+                  </Text>
+                  <Text fontSize="xs" color="gray.400" mb={2}>
+                    Source link
+                  </Text>
+                  {source.url ? (
+                    <Link href={source.url} color="blue.200" isExternal>
+                      {source.url}
+                    </Link>
+                  ) : (
+                    <Text fontSize="sm" color="gray.400">
+                      This source does not include a link.
+                    </Text>
+                  )}
+                  <Text fontSize="xs" color="gray.400" mt={4} mb={2}>
+                    Retrieved excerpt
+                  </Text>
+                  <Box
+                    bg="rgba(0, 0, 0, 0.22)"
+                    borderRadius="md"
+                    padding={3}
+                    fontSize="sm"
+                    whiteSpace="pre-wrap"
+                    color="gray.100"
+                  >
+                    {source.excerpt}
+                  </Box>
+                </Box>
+              ))}
+            </VStack>
+          </ModalBody>
+          <ModalFooter>
+            <Button onClick={() => setTraceIsOpen(false)}>Close</Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
     </VStack>
   );
 }
