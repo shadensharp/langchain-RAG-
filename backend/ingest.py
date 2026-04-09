@@ -2,6 +2,8 @@
 import logging
 import os
 import re
+import time
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 try:
@@ -19,6 +21,7 @@ except ModuleNotFoundError:
 
 import weaviate
 from bs4 import BeautifulSoup, SoupStrainer
+import requests
 
 try:
     from langchain_community.document_loaders import RecursiveUrlLoader, SitemapLoader
@@ -80,7 +83,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from openai import OpenAI
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+
+CURRENT_DOCS_SITEMAP_URL = "https://docs.langchain.com/sitemap.xml"
+CURRENT_DOCS_PREFIXES = (
+    "https://docs.langchain.com/oss/python/langchain/",
+    "https://docs.langchain.com/oss/python/langgraph/",
+    "https://docs.langchain.com/oss/python/common-errors",
+)
 
 ## QwenEmbeddings模型
 def _require_env(*names: str) -> tuple[str, ...]:
@@ -222,6 +233,96 @@ def load_langchain_docs():
     ).load()
 
 
+def _request_with_retries(
+    url: str,
+    *,
+    timeout: int = 30,
+    attempts: int = 3,
+) -> requests.Response:
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                timeout=timeout,
+                headers={"User-Agent": "chat-langchain-study/1.0"},
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.warning(
+                "Request failed for %s on attempt %s/%s: %s",
+                url,
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(attempt)
+
+    assert last_error is not None
+    raise last_error
+
+
+def _iter_current_docs_urls() -> list[str]:
+    response = _request_with_retries(CURRENT_DOCS_SITEMAP_URL, timeout=30)
+    root = ET.fromstring(response.text)
+    namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    urls = [
+        element.text.strip()
+        for element in root.findall("sm:url/sm:loc", namespace)
+        if element.text
+    ]
+    return [
+        url
+        for url in urls
+        if any(url.startswith(prefix) for prefix in CURRENT_DOCS_PREFIXES)
+    ]
+
+
+def _extract_current_docs_page(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    content_root = soup.find(id="content") or soup.find(id="content-area") or soup
+    return langchain_docs_extractor(content_root).strip()
+
+
+def load_current_langchain_docs():
+    docs = []
+    urls = _iter_current_docs_urls()
+    logger.info("Found %s current LangChain docs URLs", len(urls))
+
+    for index, url in enumerate(urls, start=1):
+        try:
+            response = _request_with_retries(url, timeout=45)
+            soup = BeautifulSoup(response.text, "lxml")
+            title = ""
+            title_tag = soup.find("title")
+            if title_tag is not None:
+                title = title_tag.get_text(strip=True)
+
+            text = _extract_current_docs_page(response.text)
+            if not text:
+                logger.warning("Skipping empty docs page: %s", url)
+                continue
+
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "source": url,
+                        "title": title or url,
+                    },
+                )
+            )
+            logger.info("Loaded current docs page %s/%s: %s", index, len(urls), url)
+        except Exception as exc:
+            logger.warning("Skipping docs page %s due to error: %s", url, exc)
+
+    return docs
+
+
 def load_langsmith_docs():
     return RecursiveUrlLoader(
         url="https://docs.smith.langchain.com/",
@@ -303,18 +404,18 @@ def ingest_docs():
     )
     record_manager.create_schema()
 
-    # docs_from_documentation = load_langchain_docs()
-    # logger.info(f"Loaded {len(docs_from_documentation)} docs from documentation")
-    docs_from_api = load_api_docs()
-    logger.info(f"Loaded {len(docs_from_api)} docs from API")
+    docs_from_documentation = load_current_langchain_docs()
+    logger.info(f"Loaded {len(docs_from_documentation)} docs from current documentation")
     # docs_from_langsmith = load_langsmith_docs()
     # logger.info(f"Loaded {len(docs_from_langsmith)} docs from Langsmith")
 
     docs_transformed = text_splitter.split_documents(
-        # docs_from_documentation + docs_from_api + docs_from_langsmith
-        docs_from_api
+        docs_from_documentation
     )
     docs_transformed = [doc for doc in docs_transformed if len(doc.page_content) > 10]
+
+    if not docs_transformed:
+        raise RuntimeError("No documentation content was loaded for ingest")
 
     # We try to return 'source' and 'title' metadata when querying vector store and
     # Weaviate will error at query time if one of the attributes is missing from a

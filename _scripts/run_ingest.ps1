@@ -13,6 +13,20 @@ param(
 $repoRoot = Get-RepoRoot
 $python = Get-VenvPython
 
+# Prefer repo-local .env values over stale shell exports, but keep explicit script flags.
+$managedEnvNames = @(
+    "WEAVIATE_URL",
+    "WEAVIATE_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "RECORD_MANAGER_DB_URL",
+    "USE_CONFIGURED_RECORD_MANAGER",
+    "FORCE_UPDATE"
+)
+
+foreach ($name in $managedEnvNames) {
+    Remove-Item ("Env:{0}" -f $name) -ErrorAction SilentlyContinue
+}
+
 if ($UseConfiguredRecordManager) {
     $env:USE_CONFIGURED_RECORD_MANAGER = "true"
     Write-Host "Using configured RECORD_MANAGER_DB_URL"
