@@ -9,19 +9,22 @@
 - 向量库：Weaviate
 - 默认模型：阿里云 DashScope 兼容接口下的 `qwen-turbo`
 - 默认向量化模型：`text-embedding-v4`
+- 当前知识库来源：LangChain / LangGraph 官方 Python 文档与 `common-errors`
 
 这个仓库适合用于：
 
-- 本地运行一个 LangChain 文档问答机器人
+- 本地运行一个 LangChain / LangGraph 文档问答机器人
 - 学习 LangChain / RAG / LangServe 的基础工程结构
 - 在现有项目上继续做二次开发
 
 ## 项目特点
 
-- 支持 LangChain 文档检索问答
+- 支持 LangChain / LangGraph 文档检索问答
 - 后端支持从本地 `.env` 自动加载环境变量
 - `ingest` 默认可使用本地 SQLite 作为 record manager
 - 提供适合 Windows 的 PowerShell 启动脚本
+- 支持会话、消息、`Good/Bad` 反馈和响应风格偏好持久化
+- 支持来源摘录与 `Trace` 展示
 - 前后端目录清晰，便于继续修改
 
 ## 目录结构
@@ -85,6 +88,8 @@ Copy-Item .env.example .env
 可选配置：
 
 - `RECORD_MANAGER_DB_URL`
+- `APP_PERSISTENCE_DB_URL`
+- `BACKEND_CORS_ORIGINS`
 - `LANGCHAIN_API_KEY`
 - `LANGCHAIN_PROJECT`
 - `LANGCHAIN_TRACING_V2`
@@ -96,7 +101,13 @@ Copy-Item .env.example .env
 powershell -File _scripts/run_ingest.ps1
 ```
 
-默认情况下会优先使用本地 SQLite：
+当前 `ingest` 会抓取：
+
+- `https://docs.langchain.com/oss/python/langchain/`
+- `https://docs.langchain.com/oss/python/langgraph/`
+- `https://docs.langchain.com/oss/python/common-errors`
+
+默认情况下会使用本地 SQLite 作为 record manager：
 
 ```text
 sqlite:///record_manager_local.db
@@ -106,6 +117,12 @@ sqlite:///record_manager_local.db
 
 ```powershell
 powershell -File _scripts/run_ingest.ps1 -UseConfiguredRecordManager
+```
+
+如果你更换了 Weaviate 集群，建议重新指定一份新的本地 record-manager 文件，避免旧集群状态干扰新集群：
+
+```powershell
+powershell -File _scripts/run_ingest.ps1 -UseLocalRecordManager -LocalRecordManagerUrl sqlite:///record_manager_rebuild.db
 ```
 
 ### 5. 启动后端
@@ -148,20 +165,34 @@ DASHSCOPE_API_KEY=
 WEAVIATE_URL=
 WEAVIATE_API_KEY=
 
-# Optional
+# Optional local/default settings
 RECORD_MANAGER_DB_URL=sqlite:///record_manager_local.db
 USE_CONFIGURED_RECORD_MANAGER=false
 FORCE_UPDATE=false
+APP_PERSISTENCE_DB_URL=sqlite:///chat_state.db
+BACKEND_CORS_ORIGINS=http://localhost:3000
 
-# LangSmith
+# Optional LangSmith tracing
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
 LANGCHAIN_API_KEY=
 LANGCHAIN_PROJECT=chat-langchain-study
 
-# Frontend
+# Optional frontend override
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
 ```
+
+## 反馈与 Trace
+
+- `Good`
+  - 将当前回答标记为正向反馈
+  - 后端会保存这条回答，并抽取其风格备注，作为后续回答的风格参考
+- `Bad`
+  - 将用户写下的调整意见与被否定的回答一起保存
+  - 后续回答会把这些内容作为风格指导，而不是事实证据
+- `Trace`
+  - 展示当前回答命中的来源页面、位置和摘录
+  - 只有当前回答带有 `sources` 时可点击；如果向量库为空或未完成 ingest，就不会显示可用 trace
 
 ## 当前改造点
 
@@ -171,7 +202,10 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
 - 默认 embedding 改为 DashScope `text-embedding-v4`
 - 增加 `.env` 本地加载逻辑
 - 增加 Windows PowerShell 启动脚本
-- `ingest` 默认使用本地 SQLite record manager，便于本地调试
+- 本地启动脚本会清理残留的 `WEAVIATE_*` 等环境变量，避免旧 shell 环境覆盖仓库 `.env`
+- `ingest` 切换到当前官方文档站点 `docs.langchain.com`
+- 当前知识库已覆盖 LangChain、LangGraph 和 `common-errors`
+- 后端新增会话、反馈和响应风格偏好的持久化能力
 
 ## 参考来源
 
